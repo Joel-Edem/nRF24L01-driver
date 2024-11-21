@@ -62,10 +62,45 @@ class RadioDriver:
                        miso=Pin(config["SPI_MISO"]))
         self.csn = Pin(config["SPI_CSN"], mode=Pin.OUT, value=1)
         self.ce = Pin(config["SPI_CE"], mode=Pin.OUT, value=0)
+        self._on = True
         # register buffer
         self._reg_buf = memoryview(bytearray(1))
         self._dynamic_mode = config["DEFAULT_PL_SZ"]
         self._last_pl_sz = 0
+
+    def power_on(self):
+        if self.is_on:
+            print("Radio Device already powered on")
+            return
+        print("nRF24L01 powering up")
+        self.spi = SPI(self.config["SPI_ID"], sck=Pin(self.config["SPI_SCK"]), mosi=Pin(self.config["SPI_MOSI"]),
+                       miso=Pin(self.config["SPI_MISO"]))
+        self.csn = Pin(self.config["SPI_CSN"], mode=Pin.OUT, value=1)
+        self.ce = Pin(self.config["SPI_CE"], mode=Pin.OUT, value=0)
+        self.toggle_power_up(True)  # set power up false
+        self.ce(1)
+        utime.sleep_us(10)
+        self.ce(0)
+        self._last_pl_sz = 0
+        self._on = True
+        print("nRF24L01 powered up")
+
+    def power_off(self):
+        if not self.is_on:
+            print("Radio device already powered down")
+        print("nRF24L01 powering down")
+        self.toggle_power_up(False)
+        self.ce(1)
+        utime.sleep_us(10)
+        self.ce(0)
+        self.spi.deinit()
+        self._on = False
+        self._last_pl_sz = 0
+        print("nRF24L01 Shut down")
+
+    @property
+    def is_on(self):
+        return self._on
 
     def read_register(self, reg) -> memoryview:
         self.csn(0)
@@ -565,6 +600,9 @@ class RadioDriver:
         Checks if device is responsive to commands
         :return:
         """
+        if not self.is_on:
+            print("Device is powered down")
+            return False
         self.toggle_power_up(False)
         self.toggle_power_up(True)
         return self.toggle_power_up(False)
@@ -605,6 +643,9 @@ class RadioDriver:
             self.set_rx_payload_length(0, self.config["DEFAULT_PL_SZ"])
 
     def configre_tx(self):
+        if not self.is_on:
+            print("Device is powered down")
+            return False
         print("Configuring as PTX")
         # nRF24L01+ must be in a standby or power down mode before
         # writing to the configuration registers
@@ -619,6 +660,9 @@ class RadioDriver:
         self.toggle_power_up(True)
 
     def configure_rx(self):
+        if not self.is_on:
+            print("Device is powered down")
+            return False
         # nRF24L01+ must be in a standby or power down mode before writing to the configuration registers
         self.toggle_power_up(False)
         # do default config
@@ -645,6 +689,9 @@ class RadioDriver:
         :param in_buf: buffer to store response
         :return:
         """
+        if not self.is_on:
+            print("Device is powered down")
+            return self.ResponseStatus.SEND_FAIL
         # TODO: if using dynamic payloads, can check the size of the
         #  received payload and incoming message prior to reading to
         #  prevent overflow in case of memory view objects.
@@ -669,6 +716,9 @@ class RadioDriver:
         return self.ResponseStatus.SEND_FAIL
 
     async def slave_exchange(self, out_buf, in_buf) -> int:
+        if not self.is_on:
+            print("Device is powered down")
+            return self.ResponseStatus.SEND_FAIL
         self.rx_write_ack_payload(out_buf)
         while not self.get_clear_rx_irq(False):
             await uasyncio.sleep_ms(0)
