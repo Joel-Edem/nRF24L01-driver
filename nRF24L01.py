@@ -160,7 +160,7 @@ class RadioDriver:
     def read_rx_payload_length(self) -> int:
         # _R_RX_PL_WID = 0x30
         self.csn(0)
-        self.spi.readinto(self._reg_buf, 0x30)  # write cmd # ignore status
+        self.spi.readinto(self._reg_buf, 0x96)  # write cmd # ignore status
         res = self.spi.read(1)
         self.csn(1)
         return int(res)
@@ -559,6 +559,15 @@ class RadioDriver:
         :return:
         """
         self.write_register(self.STATUS_REG, self.read_status_register()[0] | 0x10 | 0x20 | 0x40)
+
+    def check_device_responsive(self) -> bool:
+        """
+        Checks if device is responsive to commands
+        :return:
+        """
+        self.toggle_power_up(False)
+        self.toggle_power_up(True)
+        return self.toggle_power_up(False)
 
     def _shockburst_config(self):
 
