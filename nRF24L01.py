@@ -1,4 +1,4 @@
-# Author: Your Name
+# Author: Joel Ametepeh
 # Date: 2024-11-20
 # Description: Driver for nRF240L01 transceiver.
 #              This driver implements all registers and the Enhanced ShockBurst™ protocol.
