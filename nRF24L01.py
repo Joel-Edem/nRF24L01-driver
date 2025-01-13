@@ -58,15 +58,14 @@ class RadioDriver:
         self.is_master = is_master
 
         # initialize SPI
-        self.spi = SPI(config["SPI_ID"], sck=Pin(config["SPI_SCK"]), mosi=Pin(config["SPI_MOSI"]),
-                       miso=Pin(config["SPI_MISO"]))
+        self.spi: SPI | None = None
         self.csn = Pin(config["SPI_CSN"], mode=Pin.OUT, value=1)
         self.ce = Pin(config["SPI_CE"], mode=Pin.OUT, value=0)
-        self._on = True
-        # register buffer
+        self._on = False
         self._reg_buf = memoryview(bytearray(1))
         self._dynamic_mode = config["DEFAULT_PL_SZ"]
         self._last_pl_sz = 0
+        self.power_on()
 
     def power_on(self):
         if self.is_on:
@@ -77,6 +76,11 @@ class RadioDriver:
                        miso=Pin(self.config["SPI_MISO"]))
         self.csn = Pin(self.config["SPI_CSN"], mode=Pin.OUT, value=1)
         self.ce = Pin(self.config["SPI_CE"], mode=Pin.OUT, value=0)
+        if not self.check_device_responsive():
+            print("Could Not start NRF Radio. Device is not responsive...")
+            self._on = False
+            return
+
         self.toggle_power_up(True)  # set power up false
         self.ce(1)
         utime.sleep_us(10)
@@ -207,15 +211,15 @@ class RadioDriver:
         self.csn(1)
 
     def flush_tx_fifo(self):
-        _FLUSH_TX = const(0xE1)
+        # _FLUSH_TX = const(0xE1)
         self.csn(0)
-        self.spi.readinto(self._reg_buf, _FLUSH_TX)
+        self.spi.readinto(self._reg_buf, 0xE1)
         self.csn(1)
 
     def flush_rx_fifo(self):
-        _FLUSH_RX = const(0xE2)
+        # _FLUSH_RX = const(0xE2)
         self.csn(0)
-        self.spi.readinto(self._reg_buf, _FLUSH_RX)
+        self.spi.readinto(self._reg_buf, 0xE2)
         self.csn(1)
 
     def tx_fifo_full_flag(self) -> bool:
@@ -600,12 +604,10 @@ class RadioDriver:
         Checks if device is responsive to commands
         :return:
         """
-        if not self.is_on:
-            print("Device is powered down")
-            return False
-        self.toggle_power_up(False)
-        self.toggle_power_up(True)
-        return self.toggle_power_up(False)
+        expect_true = self.toggle_power_up(False)
+        expect_false = self.toggle_power_up(True)
+        self.toggle_power_up(expect_true)
+        return expect_true != expect_false
 
     def _shockburst_config(self):
 
@@ -675,6 +677,7 @@ class RadioDriver:
         self.ce(1)
 
     def configure(self):
+        self.power_on()
         if self.is_master:
             self.configre_tx()
         else:
