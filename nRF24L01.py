@@ -626,7 +626,7 @@ class RadioDriver:
         """
         expect_true = self.toggle_power_up(False)
         expect_false = self.toggle_power_up(True)
-        self.toggle_power_up(expect_true)
+        # self.toggle_power_up(expect_true)
         return expect_true != expect_false
 
     def _shockburst_config(self):
