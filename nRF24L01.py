@@ -50,6 +50,8 @@ class RadioDriver:
     class ResponseStatus:
         MSG_RECV = 1
         MSG_SENT_NO_RESP = 2
+        MSG_PENDING = 3
+        MSG_SENT = 4
         SEND_FAIL = 0
 
     def __init__(self, config, is_master):
@@ -76,10 +78,11 @@ class RadioDriver:
                        miso=Pin(self.config["SPI_MISO"]))
         self.csn = Pin(self.config["SPI_CSN"], mode=Pin.OUT, value=1)
         self.ce = Pin(self.config["SPI_CE"], mode=Pin.OUT, value=0)
+        utime.sleep_ms(100)
         if not self.check_device_responsive():
             print("Could Not start NRF Radio. Device is not responsive...")
             self._on = False
-            return
+            return False
 
         self.toggle_power_up(True)  # set power up false
         self.ce(1)
@@ -88,6 +91,7 @@ class RadioDriver:
         self._last_pl_sz = 0
         self._on = True
         print("nRF24L01 powered up")
+        return True
 
     def power_off(self):
         if not self.is_on:
@@ -148,10 +152,14 @@ class RadioDriver:
         """
         # _R_RX_PAYLOAD = 0x61
         # get the data
+        self._reg_buf[0] = 0xFF
         self.csn(0)
         self.spi.readinto(self._reg_buf, 0x61)  # write cmd # ignore status
         self.spi.readinto(buf)
         self.csn(1)
+        if self._reg_buf[0] == 0xFF:
+            self._on = False
+            raise OSError("FAILED TO Read RF PACKET Device not responsive")
 
     def tx_write_payload_ack(self, buf, send=True):
         """
@@ -162,6 +170,7 @@ class RadioDriver:
         :return:
         """
         # send the data
+        self._reg_buf[0] = 0xff
         self.csn(0)
         self.spi.readinto(self._reg_buf, 0xA0)
         self.spi.write(buf)
@@ -170,10 +179,14 @@ class RadioDriver:
             self.ce(1)
             utime.sleep_us(10)
             self.ce(0)
+        if self._reg_buf[0] == 0xff:
+            self._on = False
+            raise OSError("FAILED TO SEND RF PACKET Device not responsive")
 
     def tx_write_payload_no_ack(self, buf, send=True):
         # _W_TX_PAYLOAD_NO_ACK = 0xB0
         # send the data
+        self._reg_buf[0] = 0xff
         self.csn(0)
         self.spi.readinto(self._reg_buf, 0xB0)
         self.spi.write(buf)
@@ -182,6 +195,9 @@ class RadioDriver:
             self.ce(1)
             utime.sleep_us(10)
             self.ce(0)
+        if self._reg_buf[0] == 0xff:
+            self._on = False
+            raise OSError("FAILED TO SEND RF PACKET Device not responsive")
 
     def rx_write_ack_payload(self, buf, pipe_no=0):
         """
@@ -191,10 +207,14 @@ class RadioDriver:
         :return:
         """
         # _W_ACK_PAYLOAD = 0xA8 | pipe_no
+        self._reg_buf[0] = 0xff
         self.csn(0)
         self.spi.readinto(self._reg_buf, 0xA8 | pipe_no)
         self.spi.write(buf)
         self.csn(1)
+        if self._reg_buf[0] == 0xff:
+            self._on = False
+            raise OSError("FAILED TO SEND RF ACK PACKET Device not responsive")
 
     def read_rx_payload_length(self) -> int:
         # _R_RX_PL_WID = 0x30
@@ -644,7 +664,7 @@ class RadioDriver:
         else:
             self.set_rx_payload_length(0, self.config["DEFAULT_PL_SZ"])
 
-    def configre_tx(self):
+    def configure_tx(self):
         if not self.is_on:
             print("Device is powered down")
             return False
@@ -677,9 +697,10 @@ class RadioDriver:
         self.ce(1)
 
     def configure(self):
-        self.power_on()
+        if not self.is_on:
+            self.power_on()
         if self.is_master:
-            self.configre_tx()
+            self.configure_tx()
         else:
             self.configure_rx()
 
@@ -736,3 +757,51 @@ class RadioDriver:
             return await self.master_exchange(out_buf, in_buf)
         else:
             return await self.slave_exchange(out_buf, in_buf)
+
+    async def slave_send(self, buf) -> int:
+        if not self.is_on:
+            print("Device is powered down")
+            return self.ResponseStatus.SEND_FAIL
+        self.rx_write_ack_payload(buf)
+        return self.ResponseStatus.MSG_PENDING
+
+    async def master_send(self, buf, ack_pkt=True) -> int:
+        if not self._on:
+            print("Device is powered down")
+            return self.ResponseStatus.SEND_FAIL
+        self.tx_write_payload_ack(buf) if ack_pkt else self.tx_write_payload_no_ack(buf)
+        return self.ResponseStatus.MSG_PENDING
+
+    async def send(self, buf, wait=False, timeout_ms=-1) -> int:
+        t0 = utime.ticks_ms()
+        while wait and self.tx_fifo_full_flag():
+            await uasyncio.sleep_ms(0)
+            if 0 < timeout_ms < utime.ticks_diff(utime.ticks_ms(), t0):
+                return self.ResponseStatus.SEND_FAIL
+        return await (self.master_send(buf) if self.is_master else self.slave_send(buf))
+
+    def check_slave_msg_sent(self) -> int:
+        if self.tx_fifo_empty() or self.get_clear_rx_irq(False) or self.get_clear_tx_irq(True):
+            return self.ResponseStatus.MSG_SENT
+        return self.ResponseStatus.MSG_PENDING
+
+    def check_master_msg_sent(self) -> int:
+        if self.get_clear_max_rt_irq(True):
+            return self.ResponseStatus.SEND_FAIL
+        if self.get_clear_tx_irq(True):
+            return self.ResponseStatus.MSG_SENT
+        if not self.tx_fifo_empty():
+            return self.ResponseStatus.MSG_PENDING
+        return self.ResponseStatus.SEND_FAIL
+
+    def check_msg_sent(self) -> int:
+        return self.check_master_msg_sent() if self.is_master else self.check_slave_msg_sent()
+
+    def any(self) -> bool:
+        return self.get_clear_rx_irq(False) or not self.get_rx_fifo_empty()
+
+    def readinto(self, buf):
+        self.read_rx_payload(buf)
+        self.get_clear_rx_irq(True)
+        return self.ResponseStatus.MSG_RECV
+
