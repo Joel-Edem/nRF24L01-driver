@@ -1,7 +1,7 @@
 # Author: Joel Ametepeh
 # Date: 2024-11-20
 # Description: Driver for nRF240L01 transceiver.
-#              This driver implements all registers and the Enhanced ShockBurst™ protocol.
+#              This driver implements all registers as well as the Enhanced ShockBurst™ protocol.
 #
 # Copyright 2024 Joel Ametepeh <JoelAmetepeh@gmail.com>
 #
@@ -19,7 +19,7 @@
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
 # EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
 # MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# NON-INFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 # LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
@@ -28,6 +28,46 @@ import uasyncio
 import utime
 from machine import SPI, Pin
 from micropython import const
+
+_PIPES = (b"\xe1\xf0\xf0\xf0\xf0", b"\xd2\xf0\xf0\xf0\xf0")
+_RF_CHANNEL = 97
+_DEFAULT_PAYLOAD_SZ = 16
+_EN_DYNAMIC_PL = False
+_NUM_RETRIES = 4
+_RETRY_DELAY_US = 1000  # NOTE: min=250, increments of 250 up to 250us*15
+_DATA_RATE = 1  # NOTE: '00’ – 1Mbps ‘01’ – 2Mbps ‘02’ – 250kbps # shockburst is not available for 250kbs data rate
+_RF_POWER = 3  # NOTE: (0)-18dBm  (1)-12dBm (2)-6dBm  (3)0dBm
+
+
+class NRF240LConfig:
+
+    def __init__(self,
+                 spi_id: int, spi_miso: int, spi_mosi: int, spi_sck: int, spi_csn: int, spi_ce: int,
+                 tx_pipe: bytes = _PIPES[0],
+                 rx_pipe: bytes = _PIPES[0],
+                 channel: int = _RF_CHANNEL,
+                 en_dynamic_pl: bool = _EN_DYNAMIC_PL,
+                 default_pl_sz: int = _DEFAULT_PAYLOAD_SZ,
+                 num_retries: int = _NUM_RETRIES,
+                 retry_delay_us: int = _RETRY_DELAY_US,
+                 data_rate: int = _DATA_RATE,
+                 rf_power: int = _RF_POWER,
+                 ):
+        self.SPI_ID = spi_id
+        self.SPI_MISO = spi_miso
+        self.SPI_MOSI = spi_mosi
+        self.SPI_SCK = spi_sck
+        self.SPI_CSN = spi_csn
+        self.SPI_CE = spi_ce
+        self.TX_PIPE = tx_pipe
+        self.RX_PIPE = rx_pipe
+        self.CHANNEL = channel
+        self.EN_DYNAMIC_PL = en_dynamic_pl
+        self.DEFAULT_PL_SZ = default_pl_sz
+        self.NUM_RETRIES = num_retries
+        self.RETRY_DELAY_US = retry_delay_us
+        self.DATA_RATE = data_rate
+        self.RF_POWER = rf_power
 
 
 class RadioDriver:
@@ -48,36 +88,37 @@ class RadioDriver:
     FIFO_STATUS_REG = const(0x17)
 
     class ResponseStatus:
+        SEND_FAIL = 0
         MSG_RECV = 1
         MSG_SENT_NO_RESP = 2
         MSG_PENDING = 3
         MSG_SENT = 4
-        SEND_FAIL = 0
+        TIMED_OUT = 5
+        FIFO_FULL = 6
 
-    def __init__(self, config, is_master):
+    def __init__(self, config: NRF240LConfig, is_master):
 
         self.config = config
         self.is_master = is_master
 
         # initialize SPI
         self.spi: SPI | None = None
-        self.csn = Pin(config["SPI_CSN"], mode=Pin.OUT, value=1)
-        self.ce = Pin(config["SPI_CE"], mode=Pin.OUT, value=0)
+        self.csn = Pin(config.SPI_CSN, mode=Pin.OUT, value=1)
+        self.ce = Pin(config.SPI_CE, mode=Pin.OUT, value=0)
         self._on = False
         self._reg_buf = memoryview(bytearray(1))
-        self._dynamic_mode = config["DEFAULT_PL_SZ"]
+        self._dynamic_mode = config.DEFAULT_PL_SZ
         self._last_pl_sz = 0
         self.power_on()
 
     def power_on(self):
         if self.is_on:
-            print("Radio Device already powered on")
             return
         print("nRF24L01 powering up")
-        self.spi = SPI(self.config["SPI_ID"], sck=Pin(self.config["SPI_SCK"]), mosi=Pin(self.config["SPI_MOSI"]),
-                       miso=Pin(self.config["SPI_MISO"]))
-        self.csn = Pin(self.config["SPI_CSN"], mode=Pin.OUT, value=1)
-        self.ce = Pin(self.config["SPI_CE"], mode=Pin.OUT, value=0)
+        self.spi = SPI(self.config.SPI_ID, sck=Pin(self.config.SPI_SCK), mosi=Pin(self.config.SPI_MOSI),
+                       miso=Pin(self.config.SPI_MISO))
+        self.csn = Pin(self.config.SPI_CSN, mode=Pin.OUT, value=1)
+        self.ce = Pin(self.config.SPI_CE, mode=Pin.OUT, value=0)
         utime.sleep_ms(100)
         if not self.check_device_responsive():
             print("Could Not start NRF Radio. Device is not responsive...")
@@ -95,16 +136,20 @@ class RadioDriver:
 
     def power_off(self):
         if not self.is_on:
-            print("Radio device already powered down")
+            return
         print("nRF24L01 powering down")
         self.toggle_power_up(False)
         self.ce(1)
         utime.sleep_us(10)
         self.ce(0)
+        self.flush_tx_fifo()
+        self.flush_rx_fifo()
+        self.clear_status_flags()
         self.spi.deinit()
+        self.csn(1)
         self._on = False
         self._last_pl_sz = 0
-        print("nRF24L01 Shut down")
+        print("nRF24L01 powered down")
 
     @property
     def is_on(self):
@@ -451,8 +496,8 @@ class RadioDriver:
     def get_lost_packet_count(self) -> int:
         """
         Count lost packets.
-        This counter is incrimented when a packet fails be acknowleded and Max retries is reached.
-        It counts the number of max retries that have occured. this can help indicate channel quality.
+        This counter is incremented when a packet fails be acknowledged and Max retries is reached.
+        It counts the number of max retries that have occurred. this can help indicate channel quality.
         The counter is overflow protected to 15and discontinues at max until reset.
         The counter is reset by writing to RF_CH.
         _OBSERVE_TX = 0x08
@@ -462,7 +507,7 @@ class RadioDriver:
 
     def get_retry_attempts(self) -> int:
         """
-        This counter is incrimented if an ack packet is not received.
+        This counter is incremented if an ack packet is not received.
         Count retransmitted packets.
         The counter is reset when transmission of a new packet starts
         :return:
@@ -614,7 +659,7 @@ class RadioDriver:
 
     def clear_status_flags(self):
         """
-        cleasrs RX_DR |TX_DS |MAX_RT flags in STATUS REGISTER
+        clears RX_DR |TX_DS |MAX_RT flags in STATUS REGISTER
         :return:
         """
         self.write_register(self.STATUS_REG, self.read_status_register()[0] | 0x10 | 0x20 | 0x40)
@@ -637,32 +682,32 @@ class RadioDriver:
         self.flush_tx_fifo()
         self.flush_rx_fifo()
         # set power
-        self.set_rf_power(self.config["RF_POWER"])
+        self.set_rf_power(self.config.RF_POWER)
         # set data rate
-        self.set_data_rate(self.config["DATA_RATE"])
+        self.set_data_rate(self.config.DATA_RATE)
         # enable crc
         self.en_crc()
         self.set_crc_scheme(1)
         # setup retries
-        self.set_auto_retry_delay(int(self.config["RETRY_DELAY_US"] / 250))  # 4*250us = 1ms
-        self.set_auto_retry_count(self.config["NUM_RETRIES"])
+        self.set_auto_retry_delay(int(self.config.RETRY_DELAY_US / 250))  # 4*250us = 1ms
+        self.set_auto_retry_count(self.config.NUM_RETRIES)
         # Setup channels
-        self.set_channel(self.config["CHANNEL"])
+        self.set_channel(self.config.CHANNEL)
         # set address width
-        self.set_address_width(len(self.config["TX_PIPE"]))
+        self.set_address_width(len(self.config.TX_PIPE))
         # enable pipe for shockburst
         self.toggle_enable_rx_pipe(0, True)
         # set pipe address
-        self.set_rx_pipe_address(0, self.config["RX_PIPE"])
+        self.set_rx_pipe_address(0, self.config.RX_PIPE)
         # enable auto ack for p0
         self.toggle_auto_ack_for_pipe(0)
         # Enable ack payloads
         self.enable_payloads_with_ack(True)
-        if self.config["EN_DYNAMIC_PL"]:
+        if self.config.EN_DYNAMIC_PL:
             self.enable_dynamic_pyload_length_for_pipe(0, True)
             self.toggle_dynamic_payload_length_enabled()
         else:
-            self.set_rx_payload_length(0, self.config["DEFAULT_PL_SZ"])
+            self.set_rx_payload_length(0, self.config.DEFAULT_PL_SZ)
 
     def configure_tx(self):
         if not self.is_on:
@@ -676,7 +721,7 @@ class RadioDriver:
         # set as tx device
         self.toggle_primary_rx(False)
         # set tx address
-        self.set_tx_pipe_address(self.config["TX_PIPE"])
+        self.set_tx_pipe_address(self.config.TX_PIPE)
         print("nrf Configured as Primary TX (master)")
         # power up
         self.toggle_power_up(True)
@@ -758,35 +803,72 @@ class RadioDriver:
         else:
             return await self.slave_exchange(out_buf, in_buf)
 
-    async def slave_send(self, buf) -> int:
+    async def slave_send(self, buf, timeout=-1) -> int:
         if not self.is_on:
             print("Device is powered down")
             return self.ResponseStatus.SEND_FAIL
+        if self.tx_fifo_full_flag():
+            if timeout == 0:
+                await uasyncio.sleep_ms(0)
+                return self.ResponseStatus.FIFO_FULL
+            elif timeout < 0:
+                while self.tx_fifo_full_flag():
+                    await uasyncio.sleep_ms(0)
+            else:
+                t0 = utime.ticks_ms()
+                while self.tx_fifo_full_flag():
+                    await uasyncio.sleep_ms(0)
+                    if utime.ticks_diff(utime.ticks_ms(), t0) > timeout:
+                        return self.ResponseStatus.TIMED_OUT
         self.rx_write_ack_payload(buf)
         return self.ResponseStatus.MSG_PENDING
 
-    async def master_send(self, buf, ack_pkt=True) -> int:
+    async def master_send(self, buf, ack_pkt=True, retries=-1, timeout=-1) -> int:
         if not self._on:
             print("Device is powered down")
             return self.ResponseStatus.SEND_FAIL
+        if self.tx_fifo_full_flag():
+            if timeout == 0:
+                if self.get_clear_max_rt_irq(False):
+                    return self.ResponseStatus.SEND_FAIL
+                return self.ResponseStatus.FIFO_FULL
+            else:
+                t0 = utime.ticks_ms()
+                while self.tx_fifo_full_flag():
+                    if self.get_clear_max_rt_irq():
+                        self.ce(1)
+                        utime.sleep_us(10)  # Todo: maybe sleep 0. but less than 4ms is not guaranteed in asyncio.
+                        self.ce(0)
+                        if self.tx_fifo_full_flag():
+                            if not retries:
+                                return self.ResponseStatus.SEND_FAIL
+                            if 0 < timeout < utime.ticks_diff(utime.ticks_ms(), t0):
+                                return self.ResponseStatus.TIMED_OUT
+                            if retries > 0:
+                                retries -= 1
+                    await uasyncio.sleep_ms(0)
+        while not self.tx_fifo_empty():
+            self.ce(1)
+            await uasyncio.sleep_ms(0)
+            self.ce(0)
+            if self.get_clear_max_rt_irq():
+                break
         self.tx_write_payload_ack(buf) if ack_pkt else self.tx_write_payload_no_ack(buf)
         return self.ResponseStatus.MSG_PENDING
 
-    async def send(self, buf, wait=False, timeout_ms=-1) -> int:
-        t0 = utime.ticks_ms()
-        while wait and self.tx_fifo_full_flag():
-            await uasyncio.sleep_ms(0)
-            if 0 < timeout_ms < utime.ticks_diff(utime.ticks_ms(), t0):
-                return self.ResponseStatus.SEND_FAIL
-        return await (self.master_send(buf) if self.is_master else self.slave_send(buf))
+    async def send(self, buf, timeout=-1, retries=-1) -> int:
+        if self.is_master:
+            return await self.master_send(buf, timeout=timeout, retries=retries)
+        else:
+            return await self.slave_send(buf, timeout=timeout)
 
     def check_slave_msg_sent(self) -> int:
-        if self.tx_fifo_empty() or self.get_clear_rx_irq(False) or self.get_clear_tx_irq(True):
+        if self.get_clear_tx_irq(True) or self.tx_fifo_empty():
             return self.ResponseStatus.MSG_SENT
         return self.ResponseStatus.MSG_PENDING
 
     def check_master_msg_sent(self) -> int:
-        if self.get_clear_max_rt_irq(True):
+        if self.get_clear_max_rt_irq(False):
             return self.ResponseStatus.SEND_FAIL
         if self.get_clear_tx_irq(True):
             return self.ResponseStatus.MSG_SENT
@@ -794,14 +876,23 @@ class RadioDriver:
             return self.ResponseStatus.MSG_PENDING
         return self.ResponseStatus.SEND_FAIL
 
+    async def clear_tx_buf(self, retry_first: bool = True):
+        if retry_first:
+            self.get_clear_max_rt_irq()
+            self.ce(1)
+            await uasyncio.sleep_ms(1)
+            self.ce(0)
+        self.flush_tx_fifo()
+        self.get_clear_max_rt_irq()
+        self.get_clear_tx_irq()
+
     def check_msg_sent(self) -> int:
         return self.check_master_msg_sent() if self.is_master else self.check_slave_msg_sent()
 
     def any(self) -> bool:
-        return self.get_clear_rx_irq(False) or not self.get_rx_fifo_empty()
+        return not self.get_rx_fifo_empty() or self.get_clear_rx_irq(False)
 
     def readinto(self, buf):
         self.read_rx_payload(buf)
         self.get_clear_rx_irq(True)
         return self.ResponseStatus.MSG_RECV
-
