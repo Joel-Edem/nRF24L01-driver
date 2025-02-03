@@ -827,32 +827,50 @@ class RadioDriver:
         if not self._on:
             print("Device is powered down")
             return self.ResponseStatus.SEND_FAIL
-        if self.tx_fifo_full_flag():
-            if timeout == 0:
-                if self.get_clear_max_rt_irq(False):
-                    return self.ResponseStatus.SEND_FAIL
-                return self.ResponseStatus.FIFO_FULL
-            else:
-                t0 = utime.ticks_ms()
-                while self.tx_fifo_full_flag():
-                    if self.get_clear_max_rt_irq():
-                        self.ce(1)
-                        utime.sleep_us(10)  # Todo: maybe sleep 0. but less than 4ms is not guaranteed in asyncio.
-                        self.ce(0)
-                        if self.tx_fifo_full_flag():
-                            if not retries:
+
+        if not self.tx_fifo_empty():
+            self.get_clear_max_rt_irq()
+            t0 = utime.ticks_ms()
+            while not self.tx_fifo_empty():
+                self.ce(1)
+                await uasyncio.sleep_ms(1)
+                self.ce(0)
+                if self.get_clear_max_rt_irq():
+                    if retries < 0:
+                        pass
+                    else:
+                        if retries > 0:
+                            if timeout == 0:
+                                if not self.tx_fifo_full_flag():
+                                    break  # stop and add to pending
+                                else:
+                                    return self.ResponseStatus.SEND_FAIL
+                            elif timeout > 0:
+                                if utime.ticks_diff(utime.ticks_ms(), t0) > timeout:
+                                    if not self.tx_fifo_full_flag():
+                                        break  # stop and add to pending
+                                    else:
+                                        return self.ResponseStatus.SEND_FAIL
+                            retries -= 1
+                        else:
+                            if not self.tx_fifo_full_flag():
+                                break  # stop and add to pending
+                            else:
                                 return self.ResponseStatus.SEND_FAIL
-                            if 0 < timeout < utime.ticks_diff(utime.ticks_ms(), t0):
-                                return self.ResponseStatus.TIMED_OUT
-                            if retries > 0:
-                                retries -= 1
-                    await uasyncio.sleep_ms(0)
-        while not self.tx_fifo_empty():
-            self.ce(1)
-            await uasyncio.sleep_ms(0)
-            self.ce(0)
-            if self.get_clear_max_rt_irq():
-                break
+                else:
+                    if timeout == 0:
+                        if not self.tx_fifo_full_flag():
+                            break  # stop and add to pending
+                        else:
+                            return self.ResponseStatus.FIFO_FULL
+                    elif timeout > 0:
+                        if utime.ticks_diff(utime.ticks_ms(), t0) > timeout:
+                            if not self.tx_fifo_full_flag():
+                                break  # stop and add to pending
+                            else:
+                                return self.ResponseStatus.FIFO_FULL
+                await uasyncio.sleep_ms(0)
+
         self.tx_write_payload_ack(buf) if ack_pkt else self.tx_write_payload_no_ack(buf)
         return self.ResponseStatus.MSG_PENDING
 

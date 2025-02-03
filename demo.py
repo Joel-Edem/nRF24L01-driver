@@ -63,8 +63,10 @@ async def async_demo():
                 pkt_id += 1
             elif res == radio.ResponseStatus.SEND_FAIL:
                 print("send fail")
+                await uasyncio.sleep_ms(1)
             elif res == radio.ResponseStatus.FIFO_FULL:
                 print("fifo full")
+                await uasyncio.sleep_ms(1)
             elif res == radio.ResponseStatus.TIMED_OUT:
                 print("Timed out")
             else:
@@ -73,7 +75,8 @@ async def async_demo():
             while radio.any():
                 radio.readinto(in_buf)
                 print(f"Received Response: {in_buf.decode()}")
-            await uasyncio.sleep_ms(1000)
+            if IS_MASTER:
+                await uasyncio.sleep_ms(0)
     finally:
         radio.power_off()
 
